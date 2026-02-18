@@ -10,6 +10,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -21,17 +22,66 @@ jobs:
 
       - name: Trust EC2 Host
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
       - name: Ensure target dir exists on EC2
         run: |
+          set -euo pipefail
           ssh ec2-user@${{ secrets.EC2_HOST }} "mkdir -p ~/k8s-demo"
 
       - name: Sync files to EC2 (rsync)
         run: |
-          rsync -avz -e "ssh -o StrictHostKeyChecking=yes" ./ ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/k8s-demo/
+          set -euo pipefail
+          rsync -avz \
+            -e "ssh -o StrictHostKeyChecking=yes" \
+            ./ ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/k8s-demo/
 
+      # ---------- SAFETY CHECK #1: Validate image is available ----------
+      - name: Validate image availability (fail if image missing)
+        run: |
+          set -euo pipefail
+          IMAGE=$(awk '/^\s*image:\s*/{print $2; exit}' deployment.yaml)
+          if [ -z "${IMAGE:-}" ]; then
+            echo "ERROR: Could not parse 'image:' from deployment.yaml"
+            exit 1
+          fi
+          echo "Checking image: $IMAGE"
+          ssh ec2-user@${{ secrets.EC2_HOST }} "docker pull $IMAGE"
+
+      # ---------- APPLY ----------
       - name: Apply manifests
         run: |
-          ssh ec2-user@${{ secrets.EC2_HOST }} "cd ~/k8s-demo && kubectl apply -f deployment.yaml && kubectl rollout status deployment/demo-deployment --timeout=60s"
+          set -euo pipefail
+          ssh ec2-user@${{ secrets.EC2_HOST }} "cd ~/k8s-demo && kubectl apply -f deployment.yaml"
+
+      # ---------- SAFETY CHECK #2: Wait for rollout ----------
+      - name: Wait for Deployment rollout
+        run: |
+          set -euo pipefail
+          ssh ec2-user@${{ secrets.EC2_HOST }} "kubectl rollout status deployment/demo-deployment --timeout=90s"
+
+      # ---------- SAFETY CHECK #3: Ensure all pods are Ready ----------
+      - name: Ensure all Pods are Ready
+        run: |
+          set -euo pipefail
+          ssh ec2-user@${{ secrets.EC2_HOST }} "kubectl wait --for=condition=ready pod -l app=demo-app --timeout=90s"
+
+      # ---------- SAFETY CHECK #4: Emit diagnostics (always runs) ----------
+      - name: Diagnostics (pods, events, describe)
+        if: always()
+        run: |
+          set -euo pipefail
+          ssh ec2-user@${{ secrets.EC2_HOST }} '
+            echo "------ Deploy/Pods/Svc (wide) ------";
+            kubectl get deploy,po,svc -o wide || true;
+            echo "------ Recent Events ------";
+            kubectl get events --sort-by=.lastTimestamp | tail -n 50 || true;
+            echo "------ Describe Deployment ------";
+            kubectl describe deploy demo-deployment || true;
+            echo "------ Describe Pods (label app=demo-app) ------";
+            for p in $(kubectl get po -l app=demo-app -o name 2>/dev/null); do
+              kubectl describe "$p" || true;
+            done
+          '
