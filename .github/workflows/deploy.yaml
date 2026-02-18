@@ -1,0 +1,37 @@
+name: Deploy to EC2 Minikube
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'deployment.yaml'
+      - '.github/workflows/deploy.yaml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Trust EC2 Host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Ensure target dir exists on EC2
+        run: |
+          ssh ec2-user@${{ secrets.EC2_HOST }} "mkdir -p ~/k8s-demo"
+
+      - name: Sync files to EC2 (rsync)
+        run: |
+          rsync -avz -e "ssh -o StrictHostKeyChecking=yes" ./ ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/k8s-demo/
+
+      - name: Apply manifests
+        run: |
+          ssh ec2-user@${{ secrets.EC2_HOST }} "cd ~/k8s-demo && kubectl apply -f deployment.yaml && kubectl rollout status deployment/demo-deployment --timeout=60s"
